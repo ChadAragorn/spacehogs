@@ -6,11 +6,16 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 )
+
+// walkSem bounds concurrent directory-walking goroutines so the Go runtime
+// doesn't spawn an OS thread per blocked syscall and hit the 10k-thread limit.
+var walkSem = make(chan struct{}, runtime.NumCPU())
 
 // FileInfo holds information about a file or directory.
 type FileInfo struct {
@@ -94,15 +99,28 @@ func walkDirRecursive(path string, threshold uint64, excludeSet map[string]struc
 		fullPath := filepath.Join(path, entry.Name())
 
 		if entry.IsDir() {
-			wg.Add(1)
-			go func(p string) {
-				defer wg.Done()
-				subdirSize := walkDirRecursive(p, threshold, excludeSet)
+			// Try to spawn a goroutine; if the semaphore is full, recurse
+			// inline in the current goroutine to bound parallelism without
+			// risking deadlock from waiting on the semaphore.
+			select {
+			case walkSem <- struct{}{}:
+				wg.Add(1)
+				go func(p string) {
+					defer wg.Done()
+					defer func() { <-walkSem }()
+					subdirSize := walkDirRecursive(p, threshold, excludeSet)
+					if subdirSize >= threshold {
+						addResult(p, subdirSize, true)
+					}
+					sizeChannel <- subdirSize
+				}(fullPath)
+			default:
+				subdirSize := walkDirRecursive(fullPath, threshold, excludeSet)
 				if subdirSize >= threshold {
-					addResult(p, subdirSize, true)
+					addResult(fullPath, subdirSize, true)
 				}
-				sizeChannel <- subdirSize
-			}(fullPath)
+				totalSize += subdirSize
+			}
 		} else {
 			info, err := entry.Info()
 			if err != nil {
